@@ -1,0 +1,32 @@
+{
+  "name": "adb-plugin-todo",
+  "version": "1.0.0",
+  "description": "Per-user to-do lists with add, list, complete, edit, and clear commands.",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "plugin.json",
+    "commands",
+    "models",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/local-harness.js"
+  },
+  "keywords": [
+    "adb-plugin",
+    "discord",
+    "discord.js",
+    "todo"
+  ],
+  "author": "DeadIndian",
+  "license": "AGPL-3.0-only",
+  "peerDependencies": {
+    "discord.js": ">=14.0.0",
+    "mongoose": ">=7.0.0"
+  },
+  "devDependencies": {
+    "mongoose": "^8.0.0"
+  }
+}

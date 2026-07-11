@@ -1,0 +1,29 @@
+{
+  "name": "adb-plugin-todo",
+  "displayName": "To-Do List",
+  "version": "1.0.0",
+  "description": "Per-user to-do lists with add, list, complete, edit, and clear commands.",
+  "author": "DeadIndian",
+  "main": "index.js",
+  "requiresRestart": false,
+  "permissions": [
+    "db.read",
+    "db.write",
+    "commands.register"
+  ],
+  "discordPermissions": [
+    "SendMessages"
+  ],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "maxItems": {
+        "type": "number",
+        "default": 50,
+        "minimum": 1,
+        "maximum": 500,
+        "description": "Max to-do items per user per server"
+      }
+    }
+  }
+}
