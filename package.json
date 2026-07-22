@@ -1,6 +1,6 @@
 {
   "name": "adb-plugin-todo",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Per-user to-do lists with add, list, complete, edit, and clear commands.",
   "main": "index.js",
   "files": [

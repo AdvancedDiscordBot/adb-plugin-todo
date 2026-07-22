@@ -75,10 +75,37 @@ async function run() {
 	await todo.execute(clear);
 	assert(/Cleared 1 completed/.test(clear.replies[0].content), "clear removes completed tasks");
 
+	// edit -> persists new text via the RPC-style Model.save(doc, changes)
+	const add2 = fakeInteraction("add", { task: "old text" });
+	await todo.execute(add2);
+	const id2 = add2.replies[0].content.match(/`([^`]+)`/)[1];
+	const edit = fakeInteraction("edit", { id: id2, task: "new text" });
+	await todo.execute(edit);
+	assert(/Updated: new text/.test(edit.replies[0].content), "edit persists new text");
+	const listAll = fakeInteraction("list", { filter: "all" });
+	await todo.execute(listAll);
+	assert(/new text/.test(listAll.replies[0].embeds[0].description), "edited text shows in list");
+
 	// remove non-existent
 	const rm = fakeInteraction("remove", { id: "nope" });
 	await todo.execute(rm);
 	assert(/No matching task/.test(rm.replies[0].content), "remove on missing id reports not found");
+
+	// Capability gate must actually bite: a ctx built without storage denies model ops.
+	{
+		const { ctx: gatedCtx, registeredCommands: rc } = createMockCtx({
+			pluginName: "adb-plugin-todo",
+			capabilities: {}, // declare nothing
+		});
+		await load(gatedCtx);
+		let denied = false;
+		try {
+			await rc.get("todo").execute(fakeInteraction("add", { task: "x" }));
+		} catch (e) {
+			denied = /denied/.test(e.message);
+		}
+		assert(denied, "storage op denied when capability not declared (gate works)");
+	}
 
 	console.log(`\n=== Results: ${passed} passed, ${failed} failed ===\n`);
 	process.exit(failed > 0 ? 1 : 0);
