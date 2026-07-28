@@ -1,7 +1,7 @@
 {
 	"name": "adb-plugin-todo",
 	"displayName": "To-Do List",
-	"version": "1.1.0",
+	"version": "1.2.0",
 	"description": "Per-user to-do lists with add, list, complete, edit, and clear commands.",
 	"author": "DeadIndian",
 	"main": "index.js",
@@ -21,12 +21,23 @@
 	"permissions": {
 		"storage": ["own-collection"],
 		"discord": ["SendMessages", "EmbedLinks"],
+		"hooks": ["subscribe"],
 		"network": { "outbound": [] },
 		"filesystem": { "read": [], "write": [] },
 		"childProcess": false,
 		"nativeAddons": false
 	},
 	"declaredDependencies": [],
+	"engines": {
+		"core": ">=2.0.0",
+		"plugins": { "administration": ">=2.0.0" }
+	},
+	"settings": {
+		"commandPermissions": true,
+		"schema": [
+			{ "key": "maxItems", "type": "number", "label": "Max todo items per user" }
+		]
+	},
 	"discordPermissions": ["SendMessages", "EmbedLinks"],
 	"configSchema": {
 		"type": "object",
