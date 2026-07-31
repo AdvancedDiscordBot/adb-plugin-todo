@@ -1,7 +1,7 @@
 {
 	"name": "adb-plugin-todo",
 	"displayName": "To-Do List",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"description": "Per-user to-do lists with add, list, complete, edit, and clear commands.",
 	"author": "DeadIndian",
 	"main": "index.js",
@@ -39,6 +39,26 @@
 		]
 	},
 	"discordPermissions": ["SendMessages", "EmbedLinks"],
+	"webUi": {
+		"memberPages": [
+			{
+				"path": "/me/todos",
+				"label": "My To-Do",
+				"icon": "ListChecks",
+				"source": { "model": "todo", "scope": "member", "sort": { "done": 1, "createdAt": -1 }, "limit": 200 },
+				"view": {
+					"type": "list",
+					"title": "content",
+					"badge": "done",
+					"empty": "You have no to-do items in this server.",
+					"actions": [
+						{ "id": "complete", "label": "Complete", "op": "set", "field": "done", "value": true },
+						{ "id": "delete", "label": "Delete", "op": "delete" }
+					]
+				}
+			}
+		]
+	},
 	"configSchema": {
 		"type": "object",
 		"properties": {
