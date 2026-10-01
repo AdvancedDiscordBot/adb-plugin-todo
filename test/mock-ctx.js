@@ -1,336 +1,411 @@
 "use strict";
 
-/**
- * mock-ctx.js — a bot-faithful, in-memory stand-in for the ISOLATED plugin
- * context the Advanced-Discord-Bot hands a worker-thread plugin.
- *
- * The bot is the source of truth. This mock mirrors
- * core/rpc/worker-bootstrap.js `createShimContext()` + the broker
- * (core/rpc/broker.js) + methods.js capability gating, as closely as is useful
- * for offline testing. Unlike a direct-mode ctx it deliberately does NOT hand
- * back the rich mongoose surface — because a real isolated plugin never gets
- * it. That is the whole point: a test that passes here means the plugin works
- * sandboxed.
- *
- * What it faithfully reproduces:
- *   - ctx.client is `null` (isolated plugins must use ctx.discord).
- *   - ctx.discord exposes ONLY the 5 shim methods: sendToChannel, sendDM,
- *     getGuild, getMember, fetchChannel.
- *   - ctx.defineModel returns an RPC-style proxy: find() resolves to a PLAIN
- *     ARRAY (no .sort()/.limit()/.lean()); the methods are find, findOne,
- *     create, updateOne, deleteOne, countDocuments, save(doc, changes,
- *     markModifiedField). There is NO findOneAndUpdate / deleteMany / doc.save().
- *   - ctx.db exposes the plugin-config surface (getPluginConfig /
- *     updatePluginConfig / getAllPluginConfigs).
- *   - ctx.scheduler = { schedule(expression, cb, name), cancel(name) } — cron
- *     runs in Core; the mock lets the test fire a task by name via runTask().
- *   - ctx.overrideCommand() is unavailable (warns + no-ops), like the shim.
- *   - Every RPC-backed call is CAPABILITY-GATED: if the plugin's plugin.json
- *     does not declare the required capability, the call throws — exactly like
- *     the broker denying it. This is what stops "green tests lie".
- *   - ctx is Object.preventExtensions'd; only `models` is writable.
- *
- * Test-only handles (registeredCommands, registeredEvents, emitEvent, sent,
- * scheduled, runTask, pluginConfigs, hooks) are returned as a SECOND object so
- * the ctx stays faithful to what the bot hands a plugin.
- */
+// Offline contract double, not a worker/broker integration test. Both modes use
+// real Mongoose casting/defaults/validation without connecting to a database.
+// Direct: hydrated documents, no Model.save or ctx.discord, name-first scheduler.
+// Worker: detached documents with save facades, expression-first scheduler,
+// capability-gated RPC operations. runTask bypasses Core's cron event transport.
+const { Mongoose, Types } = require("mongoose");
+const assert = require("node:assert/strict");
 
-// -- Capability map (mirrors core/rpc/methods.js) ----------------------------
-// method family -> required "category:value" capability
-const CAP_FOR = {
-	"db.getPluginConfig": "storage:own-collection",
-	"db.updatePluginConfig": "storage:own-collection",
-	"db.getAllPluginConfigs": "storage:own-collection",
-	"model.*": "storage:own-collection",
-	"discord.sendToChannel": "discord:SendMessages",
-	"discord.sendDM": "discord:SendMessages",
-	"discord.getGuild": "discord:GuildInfo",
-	"discord.getMember": "discord:GuildInfo",
-	"discord.fetchChannel": "discord:ChannelInfo",
-	"scheduler.schedule": "scheduler:cron",
-	"scheduler.cancel": "scheduler:cron",
-	"hooks.on": "hooks:subscribe",
-	"hooks.emitHook": "hooks:emit",
-};
-
-function hasCapability(caps, required) {
-	if (!caps) return false;
-	const i = required.indexOf(":");
-	const cat = required.slice(0, i);
-	const val = required.slice(i + 1);
-	const list = caps[cat];
-	if (!Array.isArray(list)) return false;
-	return list.includes("*") || list.includes(val);
+function plain(value) {
+	if (value == null || typeof value !== "object") return value;
+	if (value instanceof Date) return new Date(value);
+	if (value._bsontype === "ObjectId") return value.toHexString();
+	if (Array.isArray(value)) return value.map(plain);
+	return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plain(item)]));
 }
 
-// -- RPC-style fake model (returns plain values, like the broker) ------------
-function createRpcModel(fullName, schema, requireCap) {
+function createFakeModel(fullName, schema, mode, requireCap) {
+	const mongoose = new Mongoose();
+	const Document = mongoose.model(fullName, schema);
 	const store = [];
-	let idCounter = 1;
+	const calls = [];
+	const valueOf = (value) => value instanceof Date ? value.getTime() : value;
 
-	const defaults = {};
-	const shapeObj = schema && (schema.obj || schema.tree);
-	if (shapeObj) {
-		for (const [field, def] of Object.entries(shapeObj)) {
-			if (def && typeof def === "object" && "default" in def) defaults[field] = def.default;
+	function checkQuery(query) {
+		for (const [key, value] of Object.entries(query)) {
+			if (key === "$or" || key === "$and") value.forEach(checkQuery);
+			if (key === "_id" && value != null && typeof value !== "object") schema.path("_id").cast(value);
 		}
 	}
-	const applyDefaults = (doc) => {
-		for (const [field, val] of Object.entries(defaults)) {
-			if (doc[field] === undefined) doc[field] = typeof val === "function" ? val() : val;
-		}
-		return doc;
-	};
-	const matches = (doc, query = {}) =>
-		Object.keys(query).every((k) => {
-			if (k === "_id") return String(doc._id) === String(query[k]);
-			return doc[k] === query[k];
+
+	function matches(doc, query = {}) {
+		return Object.entries(query).every(([key, expected]) => {
+			if (key === "$or") return expected.some((q) => matches(doc, q));
+			if (key === "$and") return expected.every((q) => matches(doc, q));
+			const actual = valueOf(doc[key]);
+			const cast = (value) => {
+				if (value == null) return value;
+				if (key === "_id") return String(schema.path("_id").cast(value));
+				return valueOf(schema.path(key)?.cast(value) ?? value);
+			};
+			if (expected && typeof expected === "object" && !(expected instanceof Date) && !expected._bsontype) {
+				return Object.entries(expected).every(([op, value]) => {
+					if (op === "$exists") return (doc[key] !== undefined) === value;
+					if (op === "$in") return value.map(cast).includes(actual);
+					if (op === "$nin") return !value.map(cast).includes(actual);
+					const wanted = cast(value);
+					if (op === "$eq") return wanted == null ? actual == null : actual === wanted;
+					if (op === "$ne") return wanted == null ? actual != null : actual !== wanted;
+					if (actual == null) return false;
+					if (op === "$lte") return actual <= wanted;
+					if (op === "$lt") return actual < wanted;
+					if (op === "$gte") return actual >= wanted;
+					if (op === "$gt") return actual > wanted;
+					throw new Error(`Mock does not implement query operator ${op}`);
+				});
+			}
+			return expected == null ? actual == null : actual === cast(expected);
 		});
-	// Return plain clones — isolated docs are serialized, not live mongoose docs.
-	const clone = (d) => (d == null ? d : { ...d });
+	}
+
+	function record(method, query = {}, extra = {}) {
+		requireCap("storage:own-collection");
+		calls.push({ method, query: plain(query), ...extra });
+		checkQuery(query);
+	}
+
+	function result(entry, lean = false) {
+		if (!entry) return null;
+		if (mode === "worker") {
+			const doc = plain(entry);
+			if (!lean) Object.defineProperties(doc, {
+				markModified: { value: () => {} },
+				save: { value: async () => { Object.assign(doc, await model.save(doc, doc)); return doc; } },
+			});
+			return doc;
+		}
+		if (lean) return { ...plain(entry), _id: new Types.ObjectId(entry._id) };
+		const doc = Document.hydrate(plain(entry));
+		doc.save = async () => {
+			await doc.validate();
+			const data = plain(doc.toObject());
+			const index = store.findIndex((row) => row._id === data._id);
+			if (index < 0) store.push(data);
+			else store[index] = data;
+			return doc;
+		};
+		return doc;
+	}
+
+	function query(method, filter = {}) {
+		const options = {};
+		let execution;
+		const execute = async () => {
+			record(method, filter, { options: { ...options } });
+			let rows = store.filter((row) => matches(row, filter));
+			if (options.sort) rows.sort((a, b) => {
+				for (const [key, direction] of Object.entries(options.sort)) {
+					if (a[key] < b[key]) return -direction;
+					if (a[key] > b[key]) return direction;
+				}
+				return 0;
+			});
+			if (options.skip) rows = rows.slice(options.skip);
+			if (options.limit) rows = rows.slice(0, options.limit);
+			calls[calls.length - 1].returned = method === "findOne" ? Math.min(rows.length, 1) : rows.length;
+			return method === "findOne" ? result(rows[0], options.lean) : rows.map((row) => result(row, options.lean));
+		};
+		const exec = () => execution ||= execute();
+		const builder = {
+			sort(sort) { options.sort = sort; return builder; },
+			limit(limit) { options.limit = limit; return builder; },
+			skip(skip) { options.skip = skip; return builder; },
+			lean(enabled = true) { options.lean = enabled; return builder; },
+			exec,
+			then(resolve, reject) { return exec().then(resolve, reject); },
+			catch(reject) { return exec().catch(reject); },
+			finally(fn) { return exec().finally(fn); },
+		};
+		return builder;
+	}
 
 	function applyUpdate(doc, update) {
-		if (update.$set) Object.assign(doc, update.$set);
-		if (update.$inc) for (const [k, v] of Object.entries(update.$inc)) doc[k] = (doc[k] || 0) + v;
-		if (update.$push)
-			for (const [k, v] of Object.entries(update.$push)) {
-				if (!Array.isArray(doc[k])) doc[k] = [];
-				doc[k].push(v);
-			}
-		for (const [k, v] of Object.entries(update)) if (!k.startsWith("$")) doc[k] = v;
+		for (const [key, value] of Object.entries(update)) {
+			if (key === "$set") Object.assign(doc, plain(value));
+			else if (key === "$inc") for (const [field, amount] of Object.entries(value)) doc[field] = (doc[field] || 0) + amount;
+			else if (key === "$unset") for (const field of Object.keys(value)) delete doc[field];
+			else if (key === "$push") for (const [field, item] of Object.entries(value)) (doc[field] ||= []).push(plain(item));
+			else if (key !== "$setOnInsert" && key.startsWith("$")) throw new Error(`Mock does not implement update operator ${key}`);
+			else if (!key.startsWith("$")) doc[key] = plain(value);
+		}
+		// updateOne casts but does not run validators by default in either mode.
+		Object.assign(doc, plain(new Document(doc).toObject()));
 	}
 
-	return {
+	const model = {
 		modelName: fullName,
-		async find(query = {}) {
-			requireCap("model.*");
-			return store.filter((d) => matches(d, query)).map(clone);
-		},
-		async findOne(query = {}) {
-			requireCap("model.*");
-			const d = store.find((x) => matches(x, query));
-			return d ? clone(d) : null;
-		},
+		find: (filter) => query("find", filter),
+		findOne: (filter) => query("findOne", filter),
+		findById: (id) => query("findOne", { _id: id }),
 		async create(data) {
-			requireCap("model.*");
-			const entry = applyDefaults({ _id: idCounter++, ...data });
+			record("create");
+			const doc = new Document(data);
+			await doc.validate();
+			const entry = plain(doc.toObject());
 			store.push(entry);
-			return clone(entry);
+			return result(entry);
 		},
-		async updateOne(query = {}, update = {}, opts = {}) {
-			requireCap("model.*");
-			let doc = store.find((d) => matches(d, query));
-			if (!doc && opts.upsert) {
-				doc = applyDefaults({ _id: idCounter++, ...query });
+		async updateOne(filter, update) {
+			record("updateOne", filter, { update: plain(update) });
+			const doc = store.find((row) => matches(row, filter));
+			const before = JSON.stringify(doc);
+			if (doc) applyUpdate(doc, update);
+			return { acknowledged: true, matchedCount: doc ? 1 : 0, modifiedCount: before !== JSON.stringify(doc) ? 1 : 0 };
+		},
+		async updateMany(filter, update) {
+			record("updateMany", filter);
+			const docs = store.filter((row) => matches(row, filter));
+			let modifiedCount = 0;
+			for (const doc of docs) {
+				const before = JSON.stringify(doc);
+				applyUpdate(doc, update);
+				if (before !== JSON.stringify(doc)) modifiedCount++;
+			}
+			return { acknowledged: true, matchedCount: docs.length, modifiedCount };
+		},
+		async findOneAndUpdate(filter, update, options = {}) {
+			record("findOneAndUpdate", filter);
+			let doc = store.find((row) => matches(row, filter));
+			if (!doc && options.upsert) {
+				doc = plain(new Document({ ...filter, ...update.$setOnInsert }).toObject());
 				store.push(doc);
 			}
-			if (doc) applyUpdate(doc, update);
-			return { acknowledged: true, modifiedCount: doc ? 1 : 0 };
+			if (!doc) return null;
+			const before = plain(doc);
+			applyUpdate(doc, update);
+			return result(options.new || options.returnDocument === "after" ? doc : before);
 		},
-		async deleteOne(query = {}) {
-			requireCap("model.*");
-			const idx = store.findIndex((d) => matches(d, query));
-			if (idx >= 0) store.splice(idx, 1);
-			return { acknowledged: true, deletedCount: idx >= 0 ? 1 : 0 };
+		async deleteOne(filter) {
+			record("deleteOne", filter);
+			const index = store.findIndex((row) => matches(row, filter));
+			if (index >= 0) store.splice(index, 1);
+			return { acknowledged: true, deletedCount: index >= 0 ? 1 : 0 };
 		},
-		async countDocuments(query = {}) {
-			requireCap("model.*");
-			return store.filter((d) => matches(d, query)).length;
+		async deleteMany(filter) {
+			record("deleteMany", filter);
+			const before = store.length;
+			for (let i = store.length - 1; i >= 0; i--) if (matches(store[i], filter)) store.splice(i, 1);
+			return { acknowledged: true, deletedCount: before - store.length };
 		},
-		// Persist a previously-fetched (plain) doc + its changes — the RPC shim's
-		// model.save. There is no doc.save() in isolated mode.
-		async save(doc, changes = {}, _markModifiedField) {
-			requireCap("model.*");
-			const live = store.find((d) => String(d._id) === String(doc._id));
-			if (!live) throw new Error(`Document not found: ${doc._id}`);
-			Object.assign(live, changes);
-			return clone(live);
+		async countDocuments(filter = {}) {
+			record("countDocuments", filter);
+			return store.filter((row) => matches(row, filter)).length;
 		},
 		_store: store,
+		_calls: calls,
+	};
+	if (mode === "worker") model.save = async (doc, changes = doc) => {
+		record("save", { _id: doc._id });
+		const entry = store.find((row) => row._id === String(doc._id));
+		if (!entry) throw new Error("Document not found");
+		const updated = new Document({ ...entry, ...changes });
+		await updated.validate();
+		Object.assign(entry, plain(updated.toObject()));
+		return result(entry);
+	};
+	return model;
+}
+
+function validatePayload(payload) {
+	if (typeof payload === "string") payload = { content: payload };
+	assert.ok(payload && typeof payload === "object", "reply must be a string or message options");
+	assert.ok((payload.content?.length || 0) <= 2000, "Discord content limit: 2000");
+	const embeds = payload.embeds || [];
+	assert.ok(embeds.length <= 10, "Discord embed count limit: 10");
+	let total = 0;
+	for (const embed of embeds) {
+		assert.ok((embed.description?.length || 0) <= 4096, "Discord description limit: 4096");
+		assert.ok((embed.title?.length || 0) <= 256, "Discord title limit: 256");
+		total += (embed.description?.length || 0) + (embed.title?.length || 0) +
+			(embed.footer?.text?.length || 0) + (embed.author?.name?.length || 0);
+		for (const field of embed.fields || []) total += field.name.length + field.value.length;
+	}
+	assert.ok(total <= 6000, "Discord aggregate embed text limit: 6000");
+}
+
+// Input options are nested just like Discord's subcommand data. This tests the
+// registered handler contract, not Core's interaction serialization or replies.
+function createInteraction(subcommand, values = {}, { guildId = "guild-1", userId = "user-1", channelId = "channel-1" } = {}) {
+	const options = Object.entries(values).map(([name, value]) => ({ name, type: typeof value === "number" ? 4 : 3, value }));
+	const replies = [];
+	return {
+		guildId, channelId, user: { id: userId },
+		options: {
+			data: subcommand ? [{ name: subcommand, type: 1, options }] : options,
+			getSubcommand: () => subcommand,
+			getString: (name) => options.find((option) => option.name === name)?.value ?? null,
+			getInteger: (name) => options.find((option) => option.name === name)?.value ?? null,
+		},
+		async reply(payload) {
+			assert.equal(replies.length, 0, "interaction may only be replied to once");
+			validatePayload(payload);
+			replies.push(payload);
+		},
+		replies,
 	};
 }
 
-function createMockCtx({ pluginName = "adb-plugin-REPLACE_ME", capabilities } = {}) {
-	// Default to the plugin's own declared capabilities so the gate is real.
-	let caps = capabilities;
-	if (caps === undefined) {
-		try {
-			caps = require("../plugin.json").capabilities || {};
-		} catch {
-			caps = {};
-		}
+function createMockCtx({ pluginName = require("../plugin.json").name, mode = "worker", capabilities = require("../plugin.json").capabilities } = {}) {
+	assert.ok(mode === "worker" || mode === "direct", "unknown mock runtime");
+	function requireCap(required) {
+		if (mode === "direct") return;
+		const [category, value] = required.split(":");
+		const granted = capabilities?.[category] || [];
+		if (!granted.includes(value) && !granted.includes("*")) throw new Error(`Missing capability: ${required}`);
 	}
-	const requireCap = (method) => {
-		const required = CAP_FOR[method];
-		if (required && !hasCapability(caps, required)) {
-			throw new Error(
-				`ctx call "${method}" denied: plugin does not declare capability "${required}". ` +
-					`Add it to plugin.json capabilities.`,
-			);
-		}
-	};
-
-	const logger = {
-		info: (...a) => console.log("[INFO]", `[${pluginName}]`, ...a),
-		warn: (...a) => console.warn("[WARN]", `[${pluginName}]`, ...a),
-		error: (...a) => console.error("[ERROR]", `[${pluginName}]`, ...a),
-		debug: () => {},
-	};
-
+	const logs = [];
+	const logger = Object.fromEntries(["info", "warn", "error", "debug"].map((level) => [level, (...args) => logs.push({ level, args })]));
 	const registeredCommands = new Map();
 	const registeredEvents = new Map();
 	const models = new Map();
-	const sent = []; // {kind:'channel'|'dm', id, payload}
-	const scheduled = new Map(); // name -> callback
+	const pluginConfigs = new Map();
+	const sent = [];
+	const attempts = [];
+	const sendHandlers = {};
+	const scheduled = new Map();
+	const scheduleCalls = [];
 
-	// --- HookBus mirror (subscribe/emit gated by capability) ---
+	// --- HookBus (direct) / supported hook facade (worker) --------------------
 	const handlers = new Map();
+	const anyHandlers = new Set();
 	const hooks = {
-		on(hookName, handler) {
-			requireCap("hooks.on");
-			if (!handlers.has(hookName)) handlers.set(hookName, []);
-			handlers.get(hookName).push(handler);
-			return () => {
-				const list = handlers.get(hookName) || [];
-				const i = list.indexOf(handler);
-				if (i >= 0) list.splice(i, 1);
-			};
+		on(name, handler, priority = 0) {
+			requireCap("hooks:subscribe");
+			if (!handlers.has(name)) handlers.set(name, []);
+			handlers.get(name).push({ handler, priority: mode === "worker" ? 0 : priority });
+			handlers.get(name).sort((a, b) => b.priority - a.priority);
+			return () => handlers.set(name, handlers.get(name).filter((entry) => entry.handler !== handler));
 		},
-		onAny() {
-			logger.warn("hooks.onAny() is not supported in isolated mode");
-			return () => {};
+		off(name, handler) { handlers.set(name, (handlers.get(name) || []).filter((entry) => entry.handler !== handler)); },
+		onAny(handler) {
+			if (mode === "worker") { logger.warn("hooks.onAny is unavailable in workers"); return () => {}; }
+			anyHandlers.add(handler);
+			return () => anyHandlers.delete(handler);
 		},
-		async emitHook(hookName, payload) {
-			requireCap("hooks.emitHook");
-			for (const h of handlers.get(hookName) || []) await h(payload);
-			return { cancelled: false, payload };
+		offAny: (handler) => anyHandlers.delete(handler),
+		async emitHook(name, payload) {
+			requireCap("hooks:emit");
+			let current = payload || {};
+			for (const handler of anyHandlers) await handler(name, current);
+			for (const { handler } of handlers.get(name) || []) {
+				const result = await handler(current);
+				if (mode === "direct" && result && typeof result === "object") {
+					if (result.cancel) return { cancelled: true, payload: current };
+					current = { ...current, ...result };
+				}
+			}
+			return mode === "worker" ? { ok: true } : { cancelled: false, payload: current };
 		},
 	};
+	if (mode === "worker") {
+		delete hooks.off;
+		delete hooks.offAny;
+	}
 
-	// --- Plugin-config surface ---
-	const pluginConfigs = new Map();
 	const db = {
-		async getPluginConfig(guildId, pName) {
-			requireCap("db.getPluginConfig");
-			const key = `${guildId}:${pName}`;
-			if (!pluginConfigs.has(key)) pluginConfigs.set(key, { guildId, pluginName: pName, data: {} });
-			return pluginConfigs.get(key);
+		async getPluginConfig(guildId, name) {
+			requireCap("storage:own-collection");
+			if (mode === "worker") name = pluginName;
+			const key = `${guildId}:${name}`;
+			if (!pluginConfigs.has(key)) pluginConfigs.set(key, { guildId, pluginName: name, enabled: false, data: {} });
+			return plain(pluginConfigs.get(key));
 		},
-		async updatePluginConfig(guildId, pName, data) {
-			requireCap("db.updatePluginConfig");
-			const key = `${guildId}:${pName}`;
-			const config = { guildId, pluginName: pName, data };
-			pluginConfigs.set(key, config);
-			return config;
+		async updatePluginConfig(guildId, name, data) {
+			requireCap("storage:own-collection");
+			if (mode === "worker") name = pluginName;
+			const config = { ...await db.getPluginConfig(guildId, name), data: plain(data) };
+			pluginConfigs.set(`${guildId}:${name}`, config);
+			return plain(config);
 		},
 		async getAllPluginConfigs(guildId) {
-			requireCap("db.getAllPluginConfigs");
-			return [...pluginConfigs.values()].filter((c) => c.guildId === guildId);
+			requireCap("storage:own-collection");
+			return [...pluginConfigs.values()].filter((config) => config.guildId === guildId).map(plain);
 		},
 	};
 
-	// --- Discord shim (only the 5 methods the worker exposes) ---
+	async function send(kind, id, payload) {
+		validatePayload(payload);
+		const attempt = { kind, id, payload: plain(payload) };
+		attempts.push(attempt);
+		await sendHandlers[kind]?.(attempt);
+		sent.push(attempt);
+		return mode === "worker" ? { messageId: String(sent.length) } : { id: String(sent.length) };
+	}
+	const client = mode === "worker" ? null : {
+		commands: registeredCommands,
+		users: { fetch: async (id) => ({ id, send: (payload) => send("dm", id, payload) }) },
+		channels: { cache: new Map(), fetch: async (id) => ({ id, isTextBased: () => true, send: (payload) => send("channel", id, payload) }) },
+		guilds: { cache: new Map() },
+		user: { id: "mock-bot" },
+	};
 	const discord = {
-		async sendToChannel(channelId, payload) {
-			requireCap("discord.sendToChannel");
-			sent.push({ kind: "channel", id: channelId, payload });
-			return { ok: true };
-		},
-		async sendDM(userId, payload) {
-			requireCap("discord.sendDM");
-			sent.push({ kind: "dm", id: userId, payload });
-			return { ok: true };
-		},
-		async getGuild(guildId) {
-			requireCap("discord.getGuild");
-			return { id: guildId, name: "Mock Guild", memberCount: 1, icon: null, iconURL: null };
-		},
-		async getMember(guildId, userId) {
-			requireCap("discord.getMember");
-			return { id: userId, guildId, user: { id: userId, tag: "User#0001", username: "User", avatarURL: null }, nickname: null, roles: [] };
-		},
-		async fetchChannel(channelId) {
-			requireCap("discord.fetchChannel");
-			return { id: channelId, name: "mock-channel", type: 0, guildId: "mock-guild" };
-		},
+		sendDM: async (id, payload) => { requireCap("discord:SendMessages"); return send("dm", id, typeof payload === "string" ? { content: payload } : payload); },
+		sendToChannel: async (id, payload) => { requireCap("discord:SendMessages"); return send("channel", id, typeof payload === "string" ? { content: payload } : payload); },
+		getGuild: async (id) => { requireCap("discord:GuildInfo"); return { id, name: "Mock Guild" }; },
+		getMember: async (guildId, id) => { requireCap("discord:GuildInfo"); return { id, guildId, user: { id }, roles: [] }; },
+		fetchChannel: async (id) => { requireCap("discord:ChannelInfo"); return { id, guildId: "guild-1", type: 0 }; },
 	};
 
-	// --- Scheduler shim ---
-	const scheduler = {
-		async schedule(expression, callback, name) {
-			requireCap("scheduler.schedule");
-			const taskId = name || `task_${scheduled.size + 1}`;
-			scheduled.set(taskId, callback);
-			return taskId;
-		},
-		async cancel(taskId) {
-			requireCap("scheduler.cancel");
-			scheduled.delete(taskId);
-		},
+	function schedule(name, expression, callback) {
+		requireCap("scheduler:cron");
+		assert.equal(typeof name, "string");
+		assert.equal(typeof expression, "string", "cron expression must be a string");
+		assert.equal(typeof callback, "function", "cron callback must be a function");
+		const taskId = mode === "worker" ? `${pluginName}_task_${scheduleCalls.length + 1}` : name;
+		scheduleCalls.push({ name, expression, taskId });
+		scheduled.set(taskId, callback);
+		return taskId;
+	}
+	const scheduler = mode === "worker" ? {
+		async schedule(expression, callback, name = "task_1") { return schedule(name, expression, callback); },
+		async cancel(name) { requireCap("scheduler:cron"); scheduled.delete(name); },
+	} : {
+		schedule(name, expression, callback) { schedule(name, expression, callback); return { stop: () => scheduled.delete(name) }; },
+		unschedule: (name) => scheduled.delete(name),
 	};
-
-	// --- ctx methods ---
-	function registerCommand(command) {
-		if (!command || !command.data || !command.execute) {
-			throw new Error("Invalid command: needs data and execute()");
-		}
-		registeredCommands.set(command.data.name, command);
-	}
-	function overrideCommand(name) {
-		logger.warn(`ctx.overrideCommand("${name}") is not supported in isolated mode.`);
-	}
-	function registerEvent(name, handler, options = {}) {
-		if (!registeredEvents.has(name)) registeredEvents.set(name, []);
-		registeredEvents.get(name).push({ handler, options });
-	}
-	function defineModel(modelName, schema) {
-		const fullName = `plugin_${pluginName}_${modelName}`;
-		if (!models.has(fullName)) models.set(fullName, createRpcModel(fullName, schema, requireCap));
-		return models.get(fullName);
-	}
 
 	const ctx = {
-		client: null, // isolated: never available
-		discord,
-		db,
-		scheduler,
-		commands: null,
-		registerCommand,
-		overrideCommand,
-		registerEvent,
-		defineModel,
-		models: null, // writable
-		hooks,
-		config: { env: {} }, // empty unless system:env / system:bot-token
-		logger,
+		client, db, scheduler, commands: client?.commands || null, models: null, hooks, logger,
+		config: { env: {} }, // Never expose the test runner's real environment.
+		async registerCommand(command) {
+			assert.equal(typeof command?.execute, "function");
+			assert.equal(typeof command?.data?.name, "string");
+			registeredCommands.set(command.data.name, command);
+		},
+		overrideCommand(name, factory) {
+			if (mode === "worker") { logger.warn("overrideCommand is unavailable in workers"); return; }
+			const command = registeredCommands.get(name);
+			command.execute = factory(command.execute, command);
+		},
+		registerEvent(name, handler, options = {}) {
+			if (!registeredEvents.has(name)) registeredEvents.set(name, []);
+			registeredEvents.get(name).push({ handler, options });
+		},
+		defineModel(name, schema) {
+			const fullName = `plugin_${pluginName}_${name}`;
+			if (!models.has(fullName)) models.set(fullName, createFakeModel(fullName, schema, mode, requireCap));
+			return models.get(fullName);
+		},
 	};
-	Object.keys(ctx).forEach((k) => {
-		Object.defineProperty(ctx, k, { writable: k === "models", configurable: false });
-	});
-	Object.preventExtensions(ctx);
-
-	// --- test helpers ---
-	async function emitEvent(name, ...args) {
-		for (const { handler } of registeredEvents.get(name) || []) await handler(...args);
+	if (mode === "worker") ctx.discord = discord;
+	// Only direct PluginContext currently seals fields; do not invent a worker guarantee.
+	if (mode === "direct") {
+		for (const key of Object.keys(ctx)) Object.defineProperty(ctx, key, { writable: key === "models", configurable: false });
+		Object.preventExtensions(ctx);
 	}
-	async function runTask(name) {
-		const cb = scheduled.get(name);
-		if (!cb) throw new Error(`No scheduled task named "${name}"`);
-		return cb();
-	}
-
 	return {
-		ctx,
-		registeredCommands,
-		registeredEvents,
-		models,
-		pluginConfigs,
-		sent,
-		scheduled,
-		emitEvent,
-		runTask,
-		hooks,
+		ctx, client, registeredCommands, registeredEvents, models, pluginConfigs,
+		sent, attempts, sendHandlers, scheduled, scheduleCalls, hooks, logs,
+		async emitEvent(name, ...args) {
+			for (const { handler } of registeredEvents.get(name) || []) await handler(...args, client);
+		},
+		async runTask(name) {
+			assert.ok(scheduled.has(name), `No scheduled task named ${name}`);
+			return scheduled.get(name)();
+		},
 	};
 }
 
-module.exports = { createMockCtx };
+module.exports = { createMockCtx, createInteraction, validatePayload, newId: () => new Types.ObjectId().toHexString() };
