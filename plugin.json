@@ -67,7 +67,7 @@
 				"default": 50,
 				"minimum": 1,
 				"maximum": 500,
-				"description": "Max to-do items per user per server"
+				"description": "Max pending to-do items per user per server"
 			}
 		}
 	}
